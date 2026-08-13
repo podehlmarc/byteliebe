@@ -1,0 +1,16 @@
+name = "projekt1"
+main = "worker.js"
+compatibility_date = "2026-04-07"
+
+[[durable_objects.bindings]]
+name = "TODO_ROOM"
+class_name = "TodoRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TodoRoom"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "app-auth-db"
+database_id = "bb0bb8b7-7f22-4714-912f-e84617e12d80"
