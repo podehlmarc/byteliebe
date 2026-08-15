@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+// build-trigger: neuer Build-Token nach Token-Rotation
 
 // =====================================================================
 // ASSETS (base64-kodiert, damit keine Escaping-Probleme beim Einbetten
