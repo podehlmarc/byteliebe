@@ -232,6 +232,12 @@ async function handleLogin(request, env) {
   if (user.status === "rejected") {
     return json({ error: "Dein Konto wurde nicht freigeschaltet." }, 403);
   }
+  if (user.status === "suspended") {
+    return json({ error: "Dein Konto wurde gesperrt. Wende dich an einen Admin." }, 403);
+  }
+  if (user.status !== "approved") {
+    return json({ error: "Dein Konto ist derzeit nicht aktiv." }, 403);
+  }
 
   const token = randomToken();
   await env.DB.prepare(
