@@ -14,3 +14,7 @@ new_sqlite_classes = ["TodoRoom"]
 binding = "DB"
 database_name = "app-auth-db"
 database_id = "bb0bb8b7-7f22-4714-912f-e84617e12d80"
+
+[[r2_buckets]]
+binding = "FILES_BUCKET"
+bucket_name = "byteliebe-files"
