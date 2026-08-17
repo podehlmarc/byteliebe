@@ -1,6 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 // build-trigger: neuer Build-Token nach Token-Rotation
 
+// Öffentliche Domain -- wird für Links in E-Mails etc. verwendet, damit dort
+// immer hub.byteliebe.de steht statt der internen workers.dev-Adresse,
+// unabhängig davon über welchen Host der jeweilige Request reinkam.
+const PUBLIC_BASE_URL = "https://hub.byteliebe.de";
+
 // =====================================================================
 // ASSETS (base64-kodiert, damit keine Escaping-Probleme beim Einbetten
 // entstehen -- b64d() dekodiert sie zur Laufzeit als UTF-8-Strings)
@@ -374,8 +379,7 @@ async function sendPasswordResetEmail(env, request, user, token) {
     console.log("RESEND_API_KEY fehlt -- E-Mail wurde nicht gesendet.");
     return;
   }
-  const url = new URL(request.url);
-  const resetLink = `${url.origin}/reset-password.html?token=${token}`;
+  const resetLink = `${PUBLIC_BASE_URL}/reset-password.html?token=${token}`;
   const fromAddress = env.RESET_EMAIL_FROM || "Byteliebe <onboarding@resend.dev>";
   const html =
     `<p>Hallo ${user.vorname},</p>` +
@@ -1656,7 +1660,7 @@ export default {
 
     // ---- Admin-Bereich ----
     if (path.startsWith("/admin")) {
-      if (!user) return Response.redirect(url.origin + "/login.html", 302);
+      if (!user) return Response.redirect(PUBLIC_BASE_URL + "/login.html", 302);
       if (user.role !== "admin" || user.status !== "approved") {
         return new Response("Forbidden", { status: 403 });
       }
@@ -1704,7 +1708,7 @@ export default {
     // ---- Geschützte App-Routen ----
     if (!user || user.status !== "approved") {
       if (path === "/ws") return new Response("Unauthorized", { status: 401 });
-      return Response.redirect(url.origin + "/login.html", 302);
+      return Response.redirect(PUBLIC_BASE_URL + "/login.html", 302);
     }
 
     if (path === "/ws") {
