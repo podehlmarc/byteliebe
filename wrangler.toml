@@ -1,4 +1,5 @@
-name = "projekt1"
+# wrangler.toml
+name = 'byteliebe-worker'
 main = "worker.js"
 compatibility_date = "2026-04-07"
 
