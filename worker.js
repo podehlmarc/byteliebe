@@ -309,8 +309,17 @@ async function getSessionUser(request, env) {
   const cookies = parseCookies(request);
   const token = cookies["session"];
   if (!token) return null;
+  // Bewusst KEIN "u.*": in users.avatar_data stehen Base64-Bilder (teils >40 KB),
+  // die hier bei jedem einzelnen Request mitgelesen und sofort verworfen wuerden.
+  // Gebraucht wird nur die Info, OB ein Avatar existiert -- das Bild selbst liefert
+  // /avatar/:id aus R2. Passwort-Hash und -Salt bleiben ebenfalls draussen; die
+  // holt sich handleChangePassword bei Bedarf gezielt nach.
   const row = await env.DB.prepare(
-    "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?1 AND s.expires_at > datetime('now')"
+    `SELECT u.id, u.username, u.vorname, u.nachname, u.email, u.handynummer,
+            u.role, u.status, u.last_seen_news_id, u.avatar_version,
+            (u.avatar_data IS NOT NULL) AS has_avatar
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token = ?1 AND s.expires_at > datetime('now')`
   )
     .bind(token)
     .first();
@@ -670,7 +679,10 @@ async function notifyAdmins(env) {
 
 function avatarUrlFor(user) {
   if (!user) return null;
-  if (!user.avatar_data && !user.avatar_version) return null;
+  // Zwei Aufrufformen: der Session-Nutzer bringt "has_avatar" mit (1/0), die
+  // Admin-Abfrage dagegen das echte "avatar_data". Beides muss hier passen.
+  const hasAvatar = user.has_avatar != null ? !!user.has_avatar : !!user.avatar_data;
+  if (!hasAvatar && !user.avatar_version) return null;
   return `/avatar/${user.id}?v=${user.avatar_version || 0}`;
 }
 
@@ -770,6 +782,22 @@ async function getAvatarResponse(env, userId) {
       const bytes = Uint8Array.from(atob(match[2]), (c) => c.charCodeAt(0));
       await env.FILES_BUCKET.put(r2Key, bytes, { httpMetadata: { contentType: mime } });
       obj = await env.FILES_BUCKET.get(r2Key);
+      // Erst wenn das Bild nachweislich in R2 liegt, die Base64-Kopie loeschen.
+      // Vorher waere es weg, falls der Put doch fehlschlaegt.
+      if (obj) {
+        try {
+          // avatar_version MUSS dabei auf mindestens 1 gehen: avatarUrlFor
+          // erkennt ein vorhandenes Bild sonst an nichts mehr (avatar_data ist
+          // leer, Version 0) und wuerde null liefern -- das Bild waere aus der
+          // Oberflaeche verschwunden, obwohl es in R2 liegt.
+          await env.DB.prepare(
+            "UPDATE users SET avatar_data = NULL, avatar_version = MAX(avatar_version, 1) WHERE id = ?1"
+          ).bind(userId).run();
+        } catch (err) {
+          // Aufraeumen ist Nebensache -- das Bild wird trotzdem ausgeliefert.
+          console.log("avatar_data aufraeumen fehlgeschlagen:", err);
+        }
+      }
     }
   }
   if (!obj) return new Response("Not found", { status: 404 });
@@ -822,8 +850,15 @@ async function handleChangePassword(request, env, user) {
     return json({ error: "Das neue Passwort muss mindestens 6 Zeichen lang sein." }, 400);
   }
 
-  const { hash: currentHash } = await hashPassword(currentPassword, user.password_salt);
-  if (!timingSafeEqual(currentHash, user.password_hash)) {
+  // Hash und Salt haengen nicht mehr am Session-Nutzer (siehe getSessionUser),
+  // darum hier gezielt nachladen -- passiert nur beim Passwortwechsel.
+  const creds = await env.DB.prepare(
+    "SELECT password_hash, password_salt FROM users WHERE id = ?1"
+  ).bind(user.id).first();
+  if (!creds) return json({ error: "Benutzer nicht gefunden." }, 404);
+
+  const { hash: currentHash } = await hashPassword(currentPassword, creds.password_salt);
+  if (!timingSafeEqual(currentHash, creds.password_hash)) {
     return json({ error: "Das aktuelle Passwort ist falsch." }, 403);
   }
 
@@ -1874,172 +1909,211 @@ async function getHubPreview(env, user) {
   const displayName = user.vorname + " " + user.nachname;
   const staff = isStaff(user);
 
-  // ---- To-Do: neue Aufgaben von anderen aus der Durable Object ----
-  let todo = { items: [], count: 0 };
-  try {
-    const id = env.TODO_ROOM.idFromName("main-room");
-    const stub = env.TODO_ROOM.get(id);
-    const res = await stub.fetch("https://internal/preview");
-    if (res.ok) {
-      const data = await res.json();
-      const since = parseSqlTime(seen.todo);
-      const isFresh = (createdBy, createdAt) => {
-        if (createdBy === displayName) return false;
-        // Ohne bekannten "gesehen"-Stand lieber nichts melden, statt die ganze Historie.
-        if (!since) return false;
-        const created = parseSqlTime(createdAt);
-        return created ? created > since : false;
-      };
+  // Die sieben Bereiche haengen nicht voneinander ab -- keiner liest das
+  // Ergebnis eines anderen. Nacheinander ausgefuehrt summieren sich hier 20+
+  // Roundtrips zu D1; parallel kostet der langsamste Bereich die Zeit.
+  // Jeder Block behaelt sein eigenes try/catch, damit ein Fehler weiterhin
+  // nur den einen Bereich leer laesst statt die ganze Vorschau zu kippen.
 
-      // Neue Unteraufgaben zaehlen mit, tauchen in der Vorschau aber nur ueber
-      // ihre Hauptaufgabe auf -- dort steht dann immer der Titel der Hauptaufgabe.
-      let count = 0;
-      const touched = [];
-      for (const t of data.tasks || []) {
-        const taskIsNew = isFresh(t.createdBy, t.createdAt);
-        const freshSubtasks = (t.subtasks || []).filter((s) => isFresh(s.createdBy, s.createdAt));
-        const hits = (taskIsNew ? 1 : 0) + freshSubtasks.length;
-        if (hits === 0) continue;
-        count += hits;
-        const stamps = [taskIsNew ? parseSqlTime(t.createdAt) : null, ...freshSubtasks.map((s) => parseSqlTime(s.createdAt))].filter(Boolean);
-        touched.push({ id: t.id, title: t.title, latest: stamps.reduce((a, b) => (a > b ? a : b)) });
-      }
-      touched.sort((a, b) => b.latest - a.latest);
-      todo.count = count;
-      todo.items = touched.slice(0, 3).map((t) => ({ id: t.id, title: t.title }));
-    }
-  } catch {
-    // Vorschau ist rein informativ -- bei Fehlern einfach leer lassen.
-  }
-
-  // ---- Support: neue Tickets und neue Antworten von anderen ----
-  let support = { items: [], count: 0 };
-  try {
-    const since = seen.support || null;
-
-    // Neue Tickets von anderen gibt es nur fuer Staff -- normale Nutzer sehen ohnehin
-    // ausschliesslich ihre eigenen Tickets, dort waere die Zahl immer 0.
-    let newTicketCount = 0;
-    if (staff) {
-      const row = await env.DB.prepare(
-        "SELECT COUNT(*) AS n FROM tickets WHERE created_at > ?1 AND created_by IS NOT ?2"
-      ).bind(since, user.id).first();
-      newTicketCount = (row && row.n) || 0;
-    }
-
-    const newMsgs = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM ticket_messages m JOIN tickets t ON t.id = m.ticket_id
-       WHERE m.created_at > ?1 AND m.author_id IS NOT ?2${staff ? "" : " AND t.created_by = ?2"}`
-    ).bind(since, user.id).first();
-
-    support.count = newTicketCount + ((newMsgs && newMsgs.n) || 0);
-
-    const { results } = await env.DB.prepare(
-      `SELECT t.id, t.subject, t.priority FROM tickets t
-       WHERE ( (t.created_at > ?1 AND t.created_by IS NOT ?2)
-               OR EXISTS (SELECT 1 FROM ticket_messages m
-                          WHERE m.ticket_id = t.id AND m.created_at > ?1 AND m.author_id IS NOT ?2) )
-         AND t.status != 'closed'${staff ? "" : " AND t.created_by = ?2"}
-       ORDER BY t.updated_at DESC LIMIT 3`
-    ).bind(since, user.id).all();
-    support.items = results || [];
-  } catch (err) {
-    console.log("Support-Vorschau fehlgeschlagen:", err);
-  }
-
-  // ---- News: neue Beitraege von anderen ----
-  let news = { items: [], count: 0 };
-  try {
-    const since = seen.news || null;
-    const row = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM news WHERE created_at > ?1 AND author_id IS NOT ?2"
-    ).bind(since, user.id).first();
-    news.count = (row && row.n) || 0;
-    const { results } = await env.DB.prepare(
-      `SELECT id, title, category FROM news
-       WHERE created_at > ?1 AND author_id IS NOT ?2
-       ORDER BY created_at DESC, id DESC LIMIT 3`
-    ).bind(since, user.id).all();
-    news.items = results || [];
-  } catch (err) {
-    console.log("News-Vorschau fehlgeschlagen:", err);
-  }
-
-  // ---- Projekte: neue Boards UND neue Karten von anderen ----
-  let projects = { items: [], count: 0 };
-  try {
-    const since = seen.projects || null;
-
-    const newBoardsCount = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM project_boards WHERE created_at > ?1 AND created_by IS NOT ?2"
-    ).bind(since, user.id).first();
-    const newCardsCount = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM project_cards WHERE created_at > ?1 AND created_by IS NOT ?2"
-    ).bind(since, user.id).first();
-    projects.count = ((newBoardsCount && newBoardsCount.n) || 0) + ((newCardsCount && newCardsCount.n) || 0);
-
-    const { results: newBoards } = await env.DB.prepare(
-      `SELECT id, name AS title, created_at FROM project_boards
-       WHERE created_at > ?1 AND created_by IS NOT ?2
-       ORDER BY created_at DESC LIMIT 3`
-    ).bind(since, user.id).all();
-    const { results: newCards } = await env.DB.prepare(
-      `SELECT c.id, c.title, b.name AS board_name, c.created_at FROM project_cards c
-       JOIN project_columns col ON col.id = c.column_id
-       JOIN project_boards b ON b.id = col.board_id
-       WHERE c.created_at > ?1 AND c.created_by IS NOT ?2
-       ORDER BY c.created_at DESC LIMIT 3`
-    ).bind(since, user.id).all();
-
-    const combined = [
-      ...(newBoards || []).map((b) => ({ id: b.id, title: b.title, is_board: true, created_at: b.created_at })),
-      ...(newCards || []).map((c) => ({ id: c.id, title: c.title, board_name: c.board_name, is_board: false, created_at: c.created_at })),
-    ];
-    combined.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
-    projects.items = combined.slice(0, 3);
-  } catch (err) {
-    console.log("Projekt-Vorschau fehlgeschlagen:", err);
-  }
-
-  // ---- Notizen: privat, daher ohne Zaehler -- nur die zuletzt bearbeiteten ----
-  let notes = { items: [], count: 0 };
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT id, title FROM notes WHERE user_id = ?1 ORDER BY pinned DESC, updated_at DESC LIMIT 3"
-    ).bind(user.id).all();
-    notes.items = results || [];
-  } catch {
-    // optional -- die Tabelle entsteht beim ersten Aufruf der Notizen-App
-  }
-
-  // ---- Dateien: bleiben ohne Zaehler (Dateien sind privat, es gibt nichts "von anderen") ----
-  let files = { items: [], count: 0 };
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT id, filename, size FROM file_items WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 3"
-    ).bind(user.id).all();
-    files.items = results || [];
-  } catch {
-    // optional
-  }
-
-  // ---- Admin: offene Registrierungen, die freigeschaltet werden wollen ----
-  let admin = { items: [], count: 0 };
-  if (user.role === "admin") {
+  const load_todo = async () => {
+    // ---- To-Do: neue Aufgaben von anderen aus der Durable Object ----
+    const todo = { items: [], count: 0 };
     try {
-      const row = await env.DB.prepare(
-        "SELECT COUNT(*) AS n FROM users WHERE status = 'pending'"
-      ).first();
-      admin.count = (row && row.n) || 0;
-      const { results } = await env.DB.prepare(
-        `SELECT id, vorname, nachname FROM users WHERE status = 'pending'
-         ORDER BY created_at ASC LIMIT 3`
-      ).all();
-      admin.items = results || [];
-    } catch (err) {
-      console.log("Admin-Vorschau fehlgeschlagen:", err);
+      const id = env.TODO_ROOM.idFromName("main-room");
+      const stub = env.TODO_ROOM.get(id);
+      const res = await stub.fetch("https://internal/preview");
+      if (res.ok) {
+        const data = await res.json();
+        const since = parseSqlTime(seen.todo);
+        const isFresh = (createdBy, createdAt) => {
+          if (createdBy === displayName) return false;
+          // Ohne bekannten "gesehen"-Stand lieber nichts melden, statt die ganze Historie.
+          if (!since) return false;
+          const created = parseSqlTime(createdAt);
+          return created ? created > since : false;
+        };
+
+        // Neue Unteraufgaben zaehlen mit, tauchen in der Vorschau aber nur ueber
+        // ihre Hauptaufgabe auf -- dort steht dann immer der Titel der Hauptaufgabe.
+        let count = 0;
+        const touched = [];
+        for (const t of data.tasks || []) {
+          const taskIsNew = isFresh(t.createdBy, t.createdAt);
+          const freshSubtasks = (t.subtasks || []).filter((s) => isFresh(s.createdBy, s.createdAt));
+          const hits = (taskIsNew ? 1 : 0) + freshSubtasks.length;
+          if (hits === 0) continue;
+          count += hits;
+          const stamps = [taskIsNew ? parseSqlTime(t.createdAt) : null, ...freshSubtasks.map((s) => parseSqlTime(s.createdAt))].filter(Boolean);
+          touched.push({ id: t.id, title: t.title, latest: stamps.reduce((a, b) => (a > b ? a : b)) });
+        }
+        touched.sort((a, b) => b.latest - a.latest);
+        todo.count = count;
+        todo.items = touched.slice(0, 3).map((t) => ({ id: t.id, title: t.title }));
+      }
+    } catch {
+      // Vorschau ist rein informativ -- bei Fehlern einfach leer lassen.
     }
-  }
+    return todo;
+  };
+
+  const load_support = async () => {
+    // ---- Support: neue Tickets und neue Antworten von anderen ----
+    const support = { items: [], count: 0 };
+    try {
+      const since = seen.support || null;
+
+      // Neue Tickets von anderen gibt es nur fuer Staff -- normale Nutzer sehen ohnehin
+      // ausschliesslich ihre eigenen Tickets, dort waere die Zahl immer 0.
+      // Die drei Abfragen sind unabhaengig. Der Ticketzaehler entfaellt fuer
+      // normale Nutzer -- dann steht an seiner Stelle einfach null.
+      const [ticketRow, newMsgs, listRes] = await Promise.all([
+        staff
+          ? env.DB.prepare(
+              "SELECT COUNT(*) AS n FROM tickets WHERE created_at > ?1 AND created_by IS NOT ?2"
+            ).bind(since, user.id).first()
+          : Promise.resolve(null),
+        env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM ticket_messages m JOIN tickets t ON t.id = m.ticket_id
+           WHERE m.created_at > ?1 AND m.author_id IS NOT ?2${staff ? "" : " AND t.created_by = ?2"}`
+        ).bind(since, user.id).first(),
+        env.DB.prepare(
+          `SELECT t.id, t.subject, t.priority FROM tickets t
+           WHERE ( (t.created_at > ?1 AND t.created_by IS NOT ?2)
+                   OR EXISTS (SELECT 1 FROM ticket_messages m
+                              WHERE m.ticket_id = t.id AND m.created_at > ?1 AND m.author_id IS NOT ?2) )
+             AND t.status != 'closed'${staff ? "" : " AND t.created_by = ?2"}
+           ORDER BY t.updated_at DESC LIMIT 3`
+        ).bind(since, user.id).all(),
+      ]);
+      const newTicketCount = (ticketRow && ticketRow.n) || 0;
+      support.count = newTicketCount + ((newMsgs && newMsgs.n) || 0);
+      support.items = (listRes && listRes.results) || [];
+    } catch (err) {
+      console.log("Support-Vorschau fehlgeschlagen:", err);
+    }
+    return support;
+  };
+
+  const load_news = async () => {
+    // ---- News: neue Beitraege von anderen ----
+    const news = { items: [], count: 0 };
+    try {
+      const since = seen.news || null;
+      // Zaehler und Liste sind unabhaengig -- zusammen statt nacheinander holen.
+      const [row, listRes] = await Promise.all([
+        env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM news WHERE created_at > ?1 AND author_id IS NOT ?2"
+        ).bind(since, user.id).first(),
+        env.DB.prepare(
+          `SELECT id, title, category FROM news
+           WHERE created_at > ?1 AND author_id IS NOT ?2
+           ORDER BY created_at DESC, id DESC LIMIT 3`
+        ).bind(since, user.id).all(),
+      ]);
+      news.count = (row && row.n) || 0;
+      news.items = (listRes && listRes.results) || [];
+    } catch (err) {
+      console.log("News-Vorschau fehlgeschlagen:", err);
+    }
+    return news;
+  };
+
+  const load_projects = async () => {
+    // ---- Projekte: neue Boards UND neue Karten von anderen ----
+    const projects = { items: [], count: 0 };
+    try {
+      const since = seen.projects || null;
+
+      // Alle vier Abfragen sind voneinander unabhaengig.
+      const [newBoardsCount, newCardsCount, boardsRes, cardsRes] = await Promise.all([
+        env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM project_boards WHERE created_at > ?1 AND created_by IS NOT ?2"
+        ).bind(since, user.id).first(),
+        env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM project_cards WHERE created_at > ?1 AND created_by IS NOT ?2"
+        ).bind(since, user.id).first(),
+        env.DB.prepare(
+          `SELECT id, name AS title, created_at FROM project_boards
+           WHERE created_at > ?1 AND created_by IS NOT ?2
+           ORDER BY created_at DESC LIMIT 3`
+        ).bind(since, user.id).all(),
+        env.DB.prepare(
+          `SELECT c.id, c.title, b.name AS board_name, c.created_at FROM project_cards c
+           JOIN project_columns col ON col.id = c.column_id
+           JOIN project_boards b ON b.id = col.board_id
+           WHERE c.created_at > ?1 AND c.created_by IS NOT ?2
+           ORDER BY c.created_at DESC LIMIT 3`
+        ).bind(since, user.id).all(),
+      ]);
+      projects.count = ((newBoardsCount && newBoardsCount.n) || 0) + ((newCardsCount && newCardsCount.n) || 0);
+      const newBoards = (boardsRes && boardsRes.results) || [];
+      const newCards = (cardsRes && cardsRes.results) || [];
+
+      const combined = [
+        ...(newBoards || []).map((b) => ({ id: b.id, title: b.title, is_board: true, created_at: b.created_at })),
+        ...(newCards || []).map((c) => ({ id: c.id, title: c.title, board_name: c.board_name, is_board: false, created_at: c.created_at })),
+      ];
+      combined.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+      projects.items = combined.slice(0, 3);
+    } catch (err) {
+      console.log("Projekt-Vorschau fehlgeschlagen:", err);
+    }
+    return projects;
+  };
+
+  const load_notes = async () => {
+    // ---- Notizen: privat, daher ohne Zaehler -- nur die zuletzt bearbeiteten ----
+    const notes = { items: [], count: 0 };
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT id, title FROM notes WHERE user_id = ?1 ORDER BY pinned DESC, updated_at DESC LIMIT 3"
+      ).bind(user.id).all();
+      notes.items = results || [];
+    } catch {
+      // optional -- die Tabelle entsteht beim ersten Aufruf der Notizen-App
+    }
+    return notes;
+  };
+
+  const load_files = async () => {
+    // ---- Dateien: bleiben ohne Zaehler (Dateien sind privat, es gibt nichts "von anderen") ----
+    const files = { items: [], count: 0 };
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT id, filename, size FROM file_items WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 3"
+      ).bind(user.id).all();
+      files.items = results || [];
+    } catch {
+      // optional
+    }
+    return files;
+  };
+
+  const load_admin = async () => {
+    // ---- Admin: offene Registrierungen, die freigeschaltet werden wollen ----
+    const admin = { items: [], count: 0 };
+    if (user.role === "admin") {
+      try {
+        const [row, listRes] = await Promise.all([
+          env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM users WHERE status = 'pending'"
+          ).first(),
+          env.DB.prepare(
+            `SELECT id, vorname, nachname FROM users WHERE status = 'pending'
+             ORDER BY created_at ASC LIMIT 3`
+          ).all(),
+        ]);
+        admin.count = (row && row.n) || 0;
+        admin.items = (listRes && listRes.results) || [];
+      } catch (err) {
+        console.log("Admin-Vorschau fehlgeschlagen:", err);
+      }
+    }
+    return admin;
+  };
+
+  const [todo, support, news, projects, notes, files, admin] =
+    await Promise.all([load_todo(), load_support(), load_news(), load_projects(), load_notes(), load_files(), load_admin()]);
 
   return json({ todo, notes, support, news, projects, files, admin });
 }
